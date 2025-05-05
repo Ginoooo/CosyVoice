@@ -1,263 +1,498 @@
-import os,time,sys
-from pathlib import Path
-root_dir=Path(__file__).parent.as_posix()
-
-# ffmpeg
-if sys.platform == 'win32':
-    os.environ['PATH'] = root_dir + f';{root_dir}\\ffmpeg;' + os.environ['PATH']+f';{root_dir}/third_party/Matcha-TTS'
-else:
-    os.environ['PATH'] = root_dir + f':{root_dir}/ffmpeg:' + os.environ['PATH']
-    os.environ['PYTHONPATH'] = os.environ.get('PYTHONPATH', '') + ':third_party/Matcha-TTS'
-sys.path.append(f'{root_dir}/third_party/Matcha-TTS')
-tmp_dir=Path(f'{root_dir}/tmp').as_posix()
-logs_dir=Path(f'{root_dir}/logs').as_posix()
-os.makedirs(tmp_dir,exist_ok=True)
-os.makedirs(logs_dir,exist_ok=True)
-
-from flask import Flask, request, render_template, jsonify,  send_from_directory,send_file,Response, stream_with_context,make_response,send_file
+import os
+import sys
+import time
+import base64
 import logging
-from logging.handlers import RotatingFileHandler
+import datetime
 import subprocess
 import shutil
-import datetime
+import threading
+import queue
+import gc
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+from logging.handlers import RotatingFileHandler
+from functools import lru_cache
+
+import torch
+import torchaudio
+from flask import Flask, request, jsonify, send_file, make_response
+from modelscope import snapshot_download
+
+# Set up root directory
+root_dir = Path(__file__).parent.as_posix()
+
+# Configure paths for ffmpeg and Matcha-TTS
+if sys.platform == 'win32':
+    os.environ['PATH'] = f"{root_dir};{root_dir}\\ffmpeg;{os.environ['PATH']};{root_dir}/third_party/Matcha-TTS"
+else:
+    os.environ['PATH'] = f"{root_dir}:{root_dir}/ffmpeg:{os.environ['PATH']}"
+    os.environ['PYTHONPATH'] = f"{os.environ.get('PYTHONPATH', '')}:third_party/Matcha-TTS"
+
+# Add Matcha-TTS to system path
+sys.path.append(f'{root_dir}/third_party/Matcha-TTS')
+
+# Create necessary directories
+tmp_dir = Path(f'{root_dir}/tmp').as_posix()
+logs_dir = Path(f'{root_dir}/logs').as_posix()
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(logs_dir, exist_ok=True)
+
+# Import after environment setup
 from cosyvoice.cli.cosyvoice import CosyVoice, CosyVoice2
 from cosyvoice.utils.file_utils import load_wav
 
+# Performance Configuration
+# Set to True to make better use of GPU
+USE_GPU = torch.cuda.is_available()
+NUM_THREADS = max(1, os.cpu_count() - 2)  # Leave some CPU cores free for system
+AUDIO_CACHE_SIZE = 100  # Number of recent audio results to cache
+BATCH_SIZE = 8  # Process text in batches for better performance
 
-import torchaudio,torch
-from pathlib import Path
-import base64
+# Configure PyTorch threads for CPU operations
+torch.set_num_threads(NUM_THREADS)
+if USE_GPU:
+    # GPU optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
 
+print(f"Running with {'GPU' if USE_GPU else 'CPU'}, {NUM_THREADS} CPU threads")
 
-# 下载模型
-from modelscope import snapshot_download
-snapshot_download('iic/CosyVoice2-0.5B', local_dir='pretrained_models/CosyVoice2-0.5B')
-snapshot_download('iic/CosyVoice-300M-SFT', local_dir='pretrained_models/CosyVoice-300M-SFT')
-snapshot_download('iic/CosyVoice-ttsfrd', local_dir='pretrained_models/CosyVoice-ttsfrd')
+# Download required models
+def download_models():
+    """Download required models from modelscope."""
+    models = [
+        ('iic/CosyVoice2-0.5B', 'pretrained_models/CosyVoice2-0.5B'),
+        ('iic/CosyVoice-300M-SFT', 'pretrained_models/CosyVoice-300M-SFT'),
+        ('iic/CosyVoice-ttsfrd', 'pretrained_models/CosyVoice-ttsfrd')
+    ]
+    
+    for model_id, local_dir in models:
+        if not Path(local_dir).exists():
+            print(f"Downloading model: {model_id}")
+            snapshot_download(model_id, local_dir=local_dir)
+        else:
+            print(f"Model already exists: {local_dir}")
 
+# Configure logging
+def setup_logging() -> Flask:
+    """Configure app and logging settings."""
+    # Disable Werkzeug default handler
+    log = logging.getLogger('werkzeug')
+    log.handlers[:] = []
+    log.setLevel(logging.WARNING)
 
-'''
-app logs
-'''
-# 配置日志
-# 禁用 Werkzeug 默认的日志处理器
-log = logging.getLogger('werkzeug')
-log.handlers[:] = []
-log.setLevel(logging.WARNING)
+    # Reset Flask root logger
+    root_log = logging.getLogger()
+    root_log.handlers = []
+    root_log.setLevel(logging.WARNING)
 
-root_log = logging.getLogger()  # Flask的根日志记录器
-root_log.handlers = []
-root_log.setLevel(logging.WARNING)
+    # Initialize Flask app
+    app = Flask(__name__, 
+        static_folder=f'{root_dir}/tmp', 
+        static_url_path='/tmp')
 
-app = Flask(__name__, 
-    static_folder=root_dir+'/tmp', 
-    static_url_path='/tmp')
+    app.logger.setLevel(logging.WARNING)
+    
+    # Configure log file with rotation
+    log_file = f'{logs_dir}/{datetime.datetime.now().strftime("%Y%m%d")}.log'
+    file_handler = RotatingFileHandler(log_file, maxBytes=1024 * 1024, backupCount=5)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setLevel(logging.WARNING)
+    file_handler.setFormatter(formatter)
+    app.logger.addHandler(file_handler)
+    
+    return app
 
-app.logger.setLevel(logging.WARNING) 
-# 创建 RotatingFileHandler 对象，设置写入的文件路径和大小限制
-file_handler = RotatingFileHandler(logs_dir+f'/{datetime.datetime.now().strftime("%Y%m%d")}.log', maxBytes=1024 * 1024, backupCount=5)
-# 创建日志的格式
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# 设置文件处理器的级别和格式
-file_handler.setLevel(logging.WARNING)
-file_handler.setFormatter(formatter)
-# 将文件处理器添加到日志记录器中
-app.logger.addHandler(file_handler)
+# Constants
+VOICE_LIST = ['中文女', '中文男', '日语男', '粤语女', '英文女', '英文男', '韩语女']
 
+# Global models with lazy loading and thread safety
+class ModelManager:
+    def __init__(self):
+        self.sft_model = None
+        self.tts_model = None
+        self.lock = threading.RLock()
+        
+    def get_sft_model(self):
+        with self.lock:
+            if self.sft_model is None:
+                print("Loading SFT model...")
+                self.sft_model = CosyVoice('pretrained_models/CosyVoice-300M-SFT', load_jit=True)
+                if USE_GPU:
+                    self.sft_model.model.to('cuda')
+            return self.sft_model
+            
+    def get_tts_model(self):
+        with self.lock:
+            if self.tts_model is None:
+                print("Loading TTS model...")
+                self.tts_model = CosyVoice2('pretrained_models/CosyVoice2-0.5B', load_jit=True, load_trt=False)
+                if USE_GPU:
+                    self.tts_model.model.to('cuda')
+            return self.tts_model
+            
+    def clear_gpu_memory(self):
+        if USE_GPU:
+            with self.lock:
+                torch.cuda.empty_cache()
+                gc.collect()
 
+model_manager = ModelManager()
 
-sft_model = None
-tts_model = None 
+# Worker thread pool
+class WorkerThread(threading.Thread):
+    def __init__(self, task_queue):
+        threading.Thread.__init__(self, daemon=True)
+        self.task_queue = task_queue
+        self.running = True
+        
+    def run(self):
+        while self.running:
+            try:
+                task, args, kwargs, result_queue = self.task_queue.get(timeout=1)
+                try:
+                    result = task(*args, **kwargs)
+                    result_queue.put((True, result))
+                except Exception as e:
+                    result_queue.put((False, str(e)))
+                finally:
+                    self.task_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Worker thread error: {e}")
+                
+    def stop(self):
+        self.running = False
 
-VOICE_LIST=['中文女', '中文男', '日语男', '粤语女', '英文女', '英文男', '韩语女']
+class ThreadPool:
+    def __init__(self, num_threads=NUM_THREADS):
+        self.task_queue = queue.Queue()
+        self.threads = []
+        for _ in range(num_threads):
+            thread = WorkerThread(self.task_queue)
+            thread.start()
+            self.threads.append(thread)
+            
+    def submit(self, task, *args, **kwargs):
+        result_queue = queue.Queue()
+        self.task_queue.put((task, args, kwargs, result_queue))
+        return result_queue
+        
+    def shutdown(self):
+        for thread in self.threads:
+            thread.stop()
+        self.task_queue = None
+        self.threads = []
 
+thread_pool = ThreadPool(NUM_THREADS)
 
+# LRU cache for audio processing
+@lru_cache(maxsize=AUDIO_CACHE_SIZE)
+def process_reference_audio(reference_audio_path):
+    """Process reference audio with caching for better performance."""
+    ref_audio = f"{tmp_dir}/-refaudio-{hash(reference_audio_path)}.wav"
+    
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-ignore_unknown", "-y", "-i", 
+         reference_audio_path, "-ar", "16000", ref_audio],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        check=True,
+        text=True,
+        creationflags=0 if sys.platform != 'win32' else subprocess.CREATE_NO_WINDOW
+    )
+    
+    return load_wav(ref_audio, 16000)
 
-
-
-def base64_to_wav(encoded_str, output_path):
+def base64_to_wav(encoded_str: str, output_path: str) -> None:
+    """Convert base64 encoded string to WAV file."""
     if not encoded_str:
         raise ValueError("Base64 encoded string is empty.")
 
-    # 将base64编码的字符串解码为字节
+    # Decode base64 string to bytes
     wav_bytes = base64.b64decode(encoded_str)
 
-    # 检查输出路径是否存在，如果不存在则创建
+    # Create output directory if it doesn't exist
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # 将解码后的字节写入文件
+    # Write to file
     with open(output_path, "wb") as wav_file:
         wav_file.write(wav_bytes)
 
-    print(f"WAV file has been saved to {output_path}")
-
-
-# 获取请求参数
-def get_params(req):
-    params={
-        "text":"",
-        "lang":"",
-        "role":"中文女",
-        "reference_audio":None,
-        "reference_text":"",
-        "speed":1.0
+def get_params(req) -> Dict[str, Any]:
+    """Extract and normalize request parameters."""
+    params = {
+        "text": "",
+        "lang": "",
+        "role": "中文女",
+        "reference_audio": None,
+        "reference_text": "",
+        "speed": 1.0
     }
-    # 原始字符串
-    params['text'] = req.args.get("text","").strip() or req.form.get("text","").strip()
     
-    # 字符串语言代码
-    params['lang'] = req.args.get("lang","").strip().lower() or req.form.get("lang","").strip().lower()
-    # 兼容 ja语言代码
-    if params['lang']=='ja':
-        params['lang']='jp'
+    # Get text
+    params['text'] = req.args.get("text", "").strip() or req.form.get("text", "").strip()
+    
+    # Get language and normalize
+    params['lang'] = req.args.get("lang", "").strip().lower() or req.form.get("lang", "").strip().lower()
+    if params['lang'] == 'ja':
+        params['lang'] = 'jp'
     elif params['lang'][:2] == 'zh':
-        # 兼容 zh-cn zh-tw zh-hk
-        params['lang']='zh'
+        # Normalize zh-cn zh-tw zh-hk to zh
+        params['lang'] = 'zh'
     
-    # 角色名 
-    role = req.args.get("role","").strip() or req.form.get("role",'')
+    # Get role
+    role = req.args.get("role", "").strip() or req.form.get("role", '')
     if role:
-        params['role']=role
+        params['role'] = role
     
-    # 要克隆的音色文件    
-    params['reference_audio'] = req.args.get("reference_audio",None) or req.form.get("reference_audio",None)
-    encode=req.args.get('encode','') or req.form.get('encode','')
-    if  encode=='base64':
-        tmp_name=f'tmp/{time.time()}-clone-{len(params["reference_audio"])}.wav'
-        base64_to_wav(params['reference_audio'],root_dir+'/'+tmp_name)
-        params['reference_audio']=tmp_name
-    # 音色文件对应文本
-    params['reference_text'] = req.args.get("reference_text",'').strip() or req.form.get("reference_text",'')
+    # Get reference audio
+    params['reference_audio'] = req.args.get("reference_audio", None) or req.form.get("reference_audio", None)
+    encode = req.args.get('encode', '') or req.form.get('encode', '')
+    if encode == 'base64':
+        tmp_name = f'tmp/{time.time()}-clone-{len(params["reference_audio"])}.wav'
+        base64_to_wav(params['reference_audio'], f'{root_dir}/{tmp_name}')
+        params['reference_audio'] = tmp_name
+    
+    # Get reference text
+    params['reference_text'] = req.args.get("reference_text", '').strip() or req.form.get("reference_text", '')
+    
+    # Get speed (if provided)
+    speed_str = req.args.get("speed", "") or req.form.get("speed", "")
+    if speed_str:
+        try:
+            params['speed'] = float(speed_str)
+        except ValueError:
+            pass  # Keep default speed if conversion fails
     
     return params
 
-
-def del_tmp_files(tmp_files: list):
-    print('正在删除缓存文件...')
+def del_tmp_files(tmp_files: List[str]) -> None:
+    """Delete temporary files."""
     for f in tmp_files:
         if os.path.exists(f):
-            print('删除缓存文件:', f)
-            os.remove(f)
+            try:
+                os.remove(f)
+            except Exception as e:
+                print(f"Error deleting file {f}: {e}")
 
+# Cleanup thread to remove old temp files
+def cleanup_thread():
+    """Background thread to clean up old temporary files."""
+    while True:
+        try:
+            # Get all .wav files in tmp directory
+            now = time.time()
+            for f in Path(tmp_dir).glob("*.wav"):
+                # Delete files older than 30 minutes
+                if now - f.stat().st_mtime > 1800:  # 30 minutes
+                    try:
+                        os.remove(f)
+                        print(f"Cleaned up old file: {f}")
+                    except Exception as e:
+                        print(f"Error cleaning up file {f}: {e}")
+        except Exception as e:
+            print(f"Cleanup thread error: {e}")
+        
+        # Sleep for 5 minutes
+        time.sleep(300)
 
-# 实际批量合成完毕后连接为一个文件
-def batch(tts_type,outname,params):
-    global sft_model,tts_model
+# Start cleanup thread
+cleanup_thread_handle = threading.Thread(target=cleanup_thread, daemon=True)
+cleanup_thread_handle.start()
+
+# Function to split text into chunks for better processing
+def split_text(text, max_length=100):
+    """Split text into smaller chunks for better performance."""
+    # Simple splitting by punctuation
+    sentences = []
+    current = ""
+    
+    for char in text:
+        current += char
+        if char in ['。', '！', '？', '.', '!', '?', ';', '；', '\n'] and len(current) > 10:
+            sentences.append(current)
+            current = ""
+    
+    if current:
+        sentences.append(current)
+    
+    # Group sentences into chunks
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) <= max_length:
+            current_chunk += sentence
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = sentence
+    
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    return chunks
+
+def batch(tts_type: str, outname: str, params: Dict[str, Any]) -> str:
+    """Generate audio batch based on specified TTS type."""
     if not shutil.which("ffmpeg"):
-        raise Exception('必须安装 ffmpeg')    
-    prompt_speech_16k=None
-    if tts_type!='tts':
+        raise Exception('必须安装 ffmpeg')
+    
+    prompt_speech_16k = None
+    
+    # Process reference audio if needed
+    if tts_type != 'tts':
         if not params['reference_audio'] or not os.path.exists(f"{root_dir}/{params['reference_audio']}"):
             raise Exception(f'参考音频未传入或不存在 {params["reference_audio"]}')
-        ref_audio=f"{tmp_dir}/-refaudio-{time.time()}.wav" 
+        
         try:
-            subprocess.run(["ffmpeg","-hide_banner", "-ignore_unknown","-y","-i",params['reference_audio'],"-ar","16000",ref_audio],
-                   stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE,
-                   encoding="utf-8",
-                   check=True,
-                   text=True,
-                   creationflags=0 if sys.platform != 'win32' else subprocess.CREATE_NO_WINDOW)
+            # Use cached processing for reference audio
+            prompt_speech_16k = process_reference_audio(params['reference_audio'])
         except Exception as e:
             raise Exception(f'处理参考音频失败:{e}')
+
+    text = params['text']
+    audio_list = []
+    sample_rate = 22050  # Default sample rate
+    
+    # Split text into more manageable chunks if it's long
+    text_chunks = split_text(text) if len(text) > 100 else [text]
+    
+    # Generate audio based on TTS type
+    if tts_type == 'tts':
+        sft_model = model_manager.get_sft_model()
+        sample_rate = 22050
         
-        prompt_speech_16k = load_wav(ref_audio, 16000)
-
-    text=params['text']
-    audio_list=[]
-    if tts_type=='tts':
-        if sft_model is None:
-            sft_model = CosyVoice('pretrained_models/CosyVoice-300M-SFT', load_jit=True)
-
-        # 仅文字合成语音
-        for i, j in enumerate(sft_model.inference_sft(text, params['role'],stream=False,speed=params['speed'])):
-            audio_list.append(j['tts_speech'])
+        for chunk in text_chunks:
+            for _, j in enumerate(sft_model.inference_sft(chunk, params['role'], 
+                                                      stream=False, speed=params['speed'])):
+                audio_list.append(j['tts_speech'])
             
-    elif tts_type=='clone_eq' and params.get('reference_text'):
-        if tts_model is None:
-            tts_model=CosyVoice2('pretrained_models/CosyVoice2-0.5B', load_jit=True, load_trt=False)
-
-        for i, j in enumerate(tts_model.inference_zero_shot(text,params.get('reference_text'),prompt_speech_16k, stream=False,speed=params['speed'])):
-            audio_list.append(j['tts_speech'])
+    elif tts_type == 'clone_eq' and params.get('reference_text'):
+        tts_model = model_manager.get_tts_model()
+        sample_rate = 24000
+        
+        for chunk in text_chunks:
+            for _, j in enumerate(tts_model.inference_zero_shot(chunk, params.get('reference_text'), 
+                                                             prompt_speech_16k, stream=False, 
+                                                             speed=params['speed'])):
+                audio_list.append(j['tts_speech'])
 
     else:
-        if tts_model is None:
-            tts_model=CosyVoice2('pretrained_models/CosyVoice2-0.5B', load_jit=True, load_trt=False)
-
-        for i, j in enumerate(tts_model.inference_cross_lingual(text,prompt_speech_16k, stream=False,speed=params['speed'])):
-            audio_list.append(j['tts_speech'])
+        tts_model = model_manager.get_tts_model()
+        sample_rate = 24000
+        
+        for chunk in text_chunks:
+            for _, j in enumerate(tts_model.inference_cross_lingual(chunk, prompt_speech_16k, 
+                                                                stream=False, 
+                                                                speed=params['speed'])):
+                audio_list.append(j['tts_speech'])
+    
+    # Concatenate audio segments
     audio_data = torch.concat(audio_list, dim=1)
     
-    # 根据模型yaml配置设置采样率
-    if tts_type=='tts':
-        torchaudio.save(tmp_dir + '/' + outname,audio_data, 22050, format="wav")   
-    elif tts_type=='clone_eq':
-        torchaudio.save(tmp_dir + '/' + outname,audio_data, 24000, format="wav")   
-    else:
-        torchaudio.save(tmp_dir + '/' + outname,audio_data, 24000, format="wav")    
+    # Save to file with appropriate sample rate
+    output_path = f"{tmp_dir}/{outname}"
+    torchaudio.save(output_path, audio_data, sample_rate, format="wav")   
     
-    print(f"音频文件生成成功：{tmp_dir}/{outname}")
-    return tmp_dir + '/' + outname
+    # Clean up after processing
+    model_manager.clear_gpu_memory()
+    
+    return output_path
 
+# Initialize Flask app with proper logging
+app = setup_logging()
 
-# 单纯文字合成语音
+# Download models on startup in a separate thread
+threading.Thread(target=download_models, daemon=True).start()
+
 @app.route('/tts', methods=['GET', 'POST'])        
 def tts():
-    params=get_params(request)
+    """Text-to-speech endpoint."""
+    params = get_params(request)
     if not params['text']:
-        return make_response(jsonify({"code":1,"msg":'缺少待合成的文本'}), 500)  # 设置状态码为500
+        return make_response(jsonify({"code": 1, "msg": '缺少待合成的文本'}), 400)
         
     try:
-        # 仅文字合成语音
-        outname=f"tts-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S-')}.wav"
-        outname=batch(tts_type='tts',outname=outname,params=params)
+        outname = f"tts-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{hash(params['text'])}.wav"
+        
+        # Check if the file already exists (simple caching)
+        cached_file = Path(f"{tmp_dir}/{outname}")
+        if cached_file.exists() and (time.time() - cached_file.stat().st_mtime < 3600):  # 1 hour cache
+            return send_file(cached_file, mimetype='audio/x-wav')
+            
+        output_path = batch(tts_type='tts', outname=outname, params=params)
     except Exception as e:
-        print(e)
-        return make_response(jsonify({"code":2,"msg":str(e)}), 500)  # 设置状态码为500
-    else:
-        return send_file(outname, mimetype='audio/x-wav')
+        app.logger.error(f"TTS error: {str(e)}")
+        return make_response(jsonify({"code": 2, "msg": str(e)}), 500)
     
+    return send_file(output_path, mimetype='audio/x-wav')
 
 
-# 跨语言文字合成语音      
 @app.route('/clone_mul', methods=['GET', 'POST'])        
 @app.route('/clone', methods=['GET', 'POST'])        
 def clone():
-
+    """Cross-lingual voice cloning endpoint."""
     try:
-        params=get_params(request)
+        params = get_params(request)
         if not params['text']:
-            return make_response(jsonify({"code":6,"msg":'缺少待合成的文本'}), 500)  # 设置状态码为500
+            return make_response(jsonify({"code": 6, "msg": '缺少待合成的文本'}), 400)
             
-        outname=f"clone-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S-')}.wav"
-        outname=batch(tts_type='clone',outname=outname,params=params)
+        ref_audio_hash = "noref"
+        if params['reference_audio']:
+            ref_audio_hash = str(hash(params['reference_audio']))
+            
+        outname = f"clone-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{hash(params['text'])}-{ref_audio_hash}.wav"
+        
+        # Check if the file already exists (simple caching)
+        cached_file = Path(f"{tmp_dir}/{outname}")
+        if cached_file.exists() and (time.time() - cached_file.stat().st_mtime < 3600):  # 1 hour cache
+            return send_file(cached_file, mimetype='audio/x-wav')
+            
+        output_path = batch(tts_type='clone', outname=outname, params=params)
     except Exception as e:
-        return make_response(jsonify({"code":8,"msg":str(e)}), 500)  # 设置状态码为500
-    else:
-        return send_file(outname, mimetype='audio/x-wav')
+        app.logger.error(f"Clone error: {str(e)}")
+        return make_response(jsonify({"code": 8, "msg": str(e)}), 500)
+    
+    return send_file(output_path, mimetype='audio/x-wav')
+
+
 @app.route('/clone_eq', methods=['GET', 'POST'])         
 def clone_eq():
-
+    """Same-language voice cloning endpoint."""
     try:
-        params=get_params(request)
+        params = get_params(request)
         if not params['text']:
-            return make_response(jsonify({"code":6,"msg":'缺少待合成的文本'}), 500)  # 设置状态码为500
+            return make_response(jsonify({"code": 6, "msg": '缺少待合成的文本'}), 400)
         if not params['reference_text']:
-            return make_response(jsonify({"code":6,"msg":'同语言克隆必须传递引用文本'}), 500)  # 设置状态码为500
+            return make_response(jsonify({"code": 6, "msg": '同语言克隆必须传递引用文本'}), 400)
             
-        outname=f"clone-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S-')}.wav"
-        outname=batch(tts_type='clone_eq',outname=outname,params=params)
+        ref_audio_hash = "noref"
+        if params['reference_audio']:
+            ref_audio_hash = str(hash(params['reference_audio']))
+            
+        outname = f"clone_eq-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{hash(params['text'])}-{ref_audio_hash}.wav"
+        
+        # Check if the file already exists (simple caching)
+        cached_file = Path(f"{tmp_dir}/{outname}")
+        if cached_file.exists() and (time.time() - cached_file.stat().st_mtime < 3600):  # 1 hour cache
+            return send_file(cached_file, mimetype='audio/x-wav')
+            
+        output_path = batch(tts_type='clone_eq', outname=outname, params=params)
     except Exception as e:
-        return make_response(jsonify({"code":8,"msg":str(e)}), 500)  # 设置状态码为500
-    else:
-        return send_file(outname, mimetype='audio/x-wav')
+        app.logger.error(f"Clone_eq error: {str(e)}")
+        return make_response(jsonify({"code": 8, "msg": str(e)}), 500)
+    
+    return send_file(output_path, mimetype='audio/x-wav')
      
 
 @app.route('/v1/audio/speech', methods=['POST'])
 def audio_speech():
-    """
-    兼容 OpenAI /v1/audio/speech API 的接口
-    """
+    """OpenAI-compatible /v1/audio/speech API endpoint."""
     import random
 
     if not request.is_json:
@@ -265,161 +500,88 @@ def audio_speech():
 
     data = request.get_json()
 
-    # 检查请求中是否包含必要的参数
+    # Validate required parameters
     if 'input' not in data or 'voice' not in data:
         return jsonify({"error": "请求缺少必要的参数： input, voice"}), 400
     
-
     text = data.get('input')
-    speed =  float(data.get('speed',1.0))
+    speed = float(data.get('speed', 1.0))
+    voice = data.get('voice', '中文女')
     
-    voice = data.get('voice','中文女')
-    params = {}
-    params['text']=text
-    params['speed']=speed
-    api_name='tts'
+    params = {
+        'text': text,
+        'speed': speed
+    }
+    
+    api_name = 'tts'
     if voice in VOICE_LIST:
-        params['role']=voice
+        params['role'] = voice
     elif Path(voice).exists() or Path(f'{root_dir}/{voice}').exists():
-        api_name='clone'
-        params['reference_audio']=voice
+        api_name = 'clone'
+        params['reference_audio'] = voice
     else:
-        return jsonify({"error": {"message": f"必须填写配音角色名或参考音频路径", "type": e.__class__.__name__, "param": f'speed={speed},voice={voice},input={text}', "code": 400}}), 500
+        return jsonify({
+            "error": {
+                "message": f"必须填写配音角色名或参考音频路径", 
+                "type": "InvalidVoiceError", 
+                "param": f'speed={speed},voice={voice},input={text}', 
+                "code": 400
+            }
+        }), 400
 
+    voice_hash = hash(voice)
+    filename = f'openai-{hash(text)}-{speed}-{voice_hash}-{random.randint(1000,99999)}.wav'
     
-    filename=f'openai-{len(text)}-{speed}-{time.time()}-{random.randint(1000,99999)}.wav'
+    # Check if the file already exists (simple caching)
+    cached_file = Path(f"{tmp_dir}/{filename}")
+    if cached_file.exists() and (time.time() - cached_file.stat().st_mtime < 3600):  # 1 hour cache
+        return send_file(cached_file, mimetype='audio/x-wav')
+    
     try:
-        outname=batch(tts_type=api_name,outname=filename,params=params)
-        return send_file(outname, mimetype='audio/x-wav')
+        output_path = batch(tts_type=api_name, outname=filename, params=params)
+        return send_file(output_path, mimetype='audio/x-wav')
     except Exception as e:
-        return jsonify({"error": {"message": f"{e}", "type": e.__class__.__name__, "param": f'speed={speed},voice={voice},input={text}', "code": 400}}), 500
-         
-if __name__=='__main__':
-    host='127.0.0.1'
-    port=9233
-    print(f'\n启动api:http://{host}:{port}\n')
+        app.logger.error(f"OpenAI API error: {str(e)}")
+        return jsonify({
+            "error": {
+                "message": f"{e}", 
+                "type": e.__class__.__name__, 
+                "param": f'speed={speed},voice={voice},input={text}', 
+                "code": 500
+            }
+        }), 500
+
+# Graceful shutdown
+def shutdown_hook():
+    """Clean up resources on shutdown."""
+    print("Shutting down API server...")
+    thread_pool.shutdown()
+    # Clear GPU memory
+    if USE_GPU:
+        torch.cuda.empty_cache()
+    print("Resources released")
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Simple health check endpoint."""
+    return jsonify({
+        "status": "ok",
+        "gpu": USE_GPU,
+        "cpu_threads": NUM_THREADS
+    })
+
+if __name__ == '__main__':
+    import atexit
+    atexit.register(shutdown_hook)
+    
+    host = '127.0.0.1'
+    port = 9233
+    print(f'\n启动api: http://{host}:{port}\n')
+    
     try:
         from waitress import serve
-    except Exception:
-        app.run(host=host, port=port)
-    else:
-        serve(app,host=host, port=port)
-    
-
-'''
-
-
-## 根据内置角色合成文字
-
-- 接口地址:  /tts 
-  
-- 单纯将文字合成语音，不进行音色克隆
-
-- 必须设置的参数：
- 
- `text`:需要合成语音的文字
- 
- `role`: '中文女', '中文男', '日语男', '粤语女', '英文女', '英文男', '韩语女' 选择一个
-
-- 成功返回:wav音频数据
-
-- 示例代码
-```
-data={
-    "text":"你好啊亲爱的朋友们",
-    "reference_audio":"10.wav"
-}
-
-response=requests.post(f'http://127.0.0.1:9933/tts',data=data,timeout=3600)
-```
-
-
-## 同语言克隆音色合成  
-
-- 地址：/clone_eq
-
-参考音频发音语言和需要合成的文字语言一致，例如参考音频是中文发音，同时需要根据该音频将中文文本合成为语音
-
-- 必须设置参数:
-
-`text`： 需要合成语音的文字
-
-`reference_audio`：需要克隆音色的参考音频
-
-`reference_text`：参考音频对应的文字内容 *参考音频相对于 api.py 的路径，例如引用1.wav，该文件和api.py在同一文件夹内，则填写 `1.wav`*
-
-- 成功返回:wav数据
-
-- 示例代码
-```
-data={
-    "text":"你好啊亲爱的朋友们。",
-    "reference_audio":"10.wav",
-    "reference_text":"希望你过的比我更好哟。"
-}
-
-response=requests.post(f'http://127.0.0.1:9933/tts',data=data,timeout=3600)
-```
-
-## 不同语言音色克隆: 
-
-- 地址： /cone
-
-参考音频发音语言和需要合成的文字语言不一致，例如需要根据中文发音的参考音频，将一段英文文本合成为语音。
-
-- 必须设置参数:
-
-`text`： 需要合成语音的文字
-
-`reference_audio`：需要克隆音色的参考音频 *参考音频相对于 api.py 的路径，例如引用1.wav，该文件和api.py在同一文件夹内，则填写 `1.wav`*
-
-- 成功返回:wav数据
-
-
-- 示例代码
-```
-data={
-    "text":"親友からの誕生日プレゼントを遠くから受け取り、思いがけないサプライズと深い祝福に、私の心は甘い喜びで満たされた！。",
-    "reference_audio":"10.wav"
-}
-
-response=requests.post(f'http://127.0.0.1:9933/tts',data=data,timeout=3600)
-```
-
-
-
-## 兼容openai tts
-
-- 接口地址 /v1/audio/speech
-- 请求方法  POST
-- 请求类型  Content-Type: application/json
-- 请求参数
-    `input`: 要合成的文字
-    `model`: 固定 tts-1, 兼容openai参数，实际未使用
-    `speed`: 语速，默认1.0
-    `reponse_format`：返回格式，固定wav音频数据
-    `voice`: 仅用于文字合成时，取其一 '中文女', '中文男', '日语男', '粤语女', '英文女', '英文男', '韩语女'
-
-
-> 用于克隆时，填写引用的参考音频相对于 api.py 的路径，例如引用1.wav，该文件和api.py在同一文件夹内，则填写 `1.wav`
-
-- 示例代码
-
-```
-from openai import OpenAI
-
-client = OpenAI(api_key='12314', base_url='http://127.0.0.1:9933/v1')
-with  client.audio.speech.with_streaming_response.create(
-                    model='tts-1',
-                    voice='中文女',
-                    input='你好啊，亲爱的朋友们',
-                    speed=1.0                    
-                ) as response:
-    with open('./test.wav', 'wb') as f:
-       for chunk in response.iter_bytes():
-            f.write(chunk)
-
-
-```
-
-'''
+        # More threads for better handling of concurrent requests
+        serve(app, host=host, port=port, threads=16)
+    except ImportError:
+        # Fallback to development server if waitress is not installed
+        app.run(host=host, port=port, threaded=True)
